@@ -1,3 +1,5 @@
+
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -13,7 +15,7 @@ from app.models import (
 )
 from app.ai_generator import AICodeGenerator
 from app.sandbox import DaytonaSandbox
-from app.validation import CodeValidator, validate_prompt
+from app.validation import CodeValidator, validate_prompt 
 from app.utils import (
     generate_session_id, format_execution_time, extract_error_info,
     is_code_similar, log_execution_metrics, parse_modification_request
@@ -27,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Recursive AI Executor",
-    description="Generate, execute, and refine Python code using AI with smart input handling",
+    description="Generate, execute, and refine Python code using AI with SECURE sandbox execution",
     version="1.0.0"
 )
 
@@ -39,22 +41,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 ai_generator = AICodeGenerator()
 sandbox = DaytonaSandbox()
-validator = CodeValidator()
+validator = CodeValidator(sandbox=sandbox)  
 sessions: Dict[str, SessionContext] = {}
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Starting Enhanced Recursive AI Executor with Smart Input Handling")
+    logger.info("Starting Enhanced Recursive AI Executor with SECURE Sandbox Execution")
     
     try:
         gemini_status = await ai_generator.check_connection()
         daytona_status = await sandbox._check_daytona_connection()
         
         logger.info(f"Gemini connection: {'OK' if gemini_status else 'FAILED'}")
-        logger.info(f"Daytona connection: {'OK' if daytona_status else 'FAILED'}")
-        logger.info("Smart input handling: ENABLED")
+        logger.info(f"Daytona sandbox connection: {'OK' if daytona_status else 'FAILED'}")
+        logger.info("SECURITY: All code execution will use Daytona sandboxes")
         
     except Exception as e:
         logger.error(f"Startup connection tests failed: {str(e)}")
@@ -65,7 +68,7 @@ async def shutdown_event():
     
     try:
         await sandbox.close()
-        logger.info("Daytona resources cleaned up")
+        logger.info("Daytona sandbox resources cleaned up")
     except Exception as e:
         logger.error(f"Error during shutdown cleanup: {str(e)}")
 
@@ -75,6 +78,7 @@ async def root():
         "message": "Enhanced Recursive AI Executor API",
         "version": "1.0.0",
         "ai_model": "Google Gemini",
+        "security": "Daytona Sandbox Execution",
         "features": "Smart Input Handling, Auto-Retry, Context-Aware Execution",
         "docs": "/docs"
     }
@@ -213,12 +217,15 @@ async def _recursive_execute_enhanced(
             
             response.status = ExecutionStatus.EXECUTING
             
-            logger.info(f"Executing code with smart input handling for attempt {attempt_num}")
+            logger.info(f"SECURITY: Executing code in Daytona sandbox for attempt {attempt_num}")
             
             try:
-                execution_result = validator.execute_code_with_smart_inputs(
+           
+                execution_result = await validator.execute_code_with_smart_inputs(
                     code=code_to_execute, 
-                    prompt=request.prompt
+                    prompt=request.prompt,
+                    session_id=session.session_id,
+                    timeout=settings.execution_timeout
                 )
                 
                 stdout = execution_result.get('stdout', '')
@@ -226,8 +233,8 @@ async def _recursive_execute_enhanced(
                 exit_code = execution_result.get('return_code', 1)
                 exec_time = execution_result.get('execution_time', 0.0)
                 
-                execution_method = execution_result.get('execution_method', 'unknown')
-                logger.info(f"Execution method used: {execution_method}")
+                execution_method = execution_result.get('execution_method', 'sandboxed')
+                logger.info(f"SECURITY: Execution method used: {execution_method} (sandboxed)")
                 
                 if execution_result.get('inputs_provided'):
                     logger.info(f"Auto-inputs provided: {execution_result['inputs_provided']}")
@@ -236,9 +243,9 @@ async def _recursive_execute_enhanced(
                     logger.info("Code was modified for input replacement")
                     
             except Exception as exec_error:
-                logger.error(f"Smart execution failed in attempt {attempt_num}: {str(exec_error)}")
+                logger.error(f"Sandboxed execution failed in attempt {attempt_num}: {str(exec_error)}")
                 stdout = ""
-                stderr = f"Smart execution error: {str(exec_error)}"
+                stderr = f"Sandbox execution error: {str(exec_error)}"
                 exit_code = 1
                 exec_time = 0.0
                 execution_result = {
@@ -246,7 +253,7 @@ async def _recursive_execute_enhanced(
                     'stderr': stderr,
                     'return_code': exit_code,
                     'execution_time': exec_time,
-                    'execution_method': 'failed'
+                    'execution_method': 'failed_sandbox'
                 }
             
             attempt = ExecutionAttempt(
@@ -260,10 +267,11 @@ async def _recursive_execute_enhanced(
             
             if hasattr(attempt, 'execution_metadata') and execution_result:
                 attempt.execution_metadata = {
-                    'execution_method': execution_result.get('execution_method', 'unknown'),
+                    'execution_method': execution_result.get('execution_method', 'sandboxed'),
                     'inputs_provided': execution_result.get('inputs_provided', []),
                     'code_modified': execution_result.get('modified_code') is not None,
-                    'validation_confidence': validation_result.get('confidence_score', 0.0) if validation_result else 0.0
+                    'validation_confidence': validation_result.get('confidence_score', 0.0) if validation_result else 0.0,
+                    'sandbox_used': True  
                 }
             
             response.attempts.append(attempt)
@@ -284,7 +292,7 @@ async def _recursive_execute_enhanced(
                         response.final_code = code_to_execute
                         
                         logger.info(
-                            f"Code execution successful after {attempt_num} attempts. "
+                            f"SECURE: Code execution successful in sandbox after {attempt_num} attempts. "
                             f"Quality: {success_analysis['output_quality']}, "
                             f"Confidence: {success_analysis['confidence_score']:.2f}"
                         )
@@ -301,7 +309,7 @@ async def _recursive_execute_enhanced(
                             response.status = ExecutionStatus.SUCCESS
                             response.success = True
                             response.final_code = code_to_execute
-                            logger.info(f"Code execution successful (basic criteria) after {attempt_num} attempts")
+                            logger.info(f"SECURE: Code execution successful (basic criteria) in sandbox after {attempt_num} attempts")
                             break
                         else:
                             logger.warning(
@@ -317,7 +325,7 @@ async def _recursive_execute_enhanced(
                         response.status = ExecutionStatus.SUCCESS
                         response.success = True
                         response.final_code = code_to_execute
-                        logger.info(f"Code execution successful (fallback) after {attempt_num} attempts")
+                        logger.info(f"SECURE: Code execution successful (fallback) in sandbox after {attempt_num} attempts")
                         break
                     else:
                         last_error = f"Success analysis failed: {str(success_error)}"
@@ -338,7 +346,7 @@ async def _recursive_execute_enhanced(
                         last_error = f"{stderr}\n\nError type: {error_info.get('type', 'Unknown')}"
                     
                     current_code = code_to_execute
-                    logger.warning(f"Attempt {attempt_num} failed: {error_info.get('type', 'Unknown error')}")
+                    logger.warning(f"SECURE: Attempt {attempt_num} failed in sandbox: {error_info.get('type', 'Unknown error')}")
                     
                 except Exception as error_processing_error:
                     logger.error(f"Error processing failure in attempt {attempt_num}: {str(error_processing_error)}")
@@ -383,7 +391,8 @@ def _update_session_context(
         "success": response.success,
         "attempts": response.total_attempts,
         "timestamp": datetime.now().isoformat(),
-        "execution_method": getattr(response.attempts[-1], 'execution_metadata', {}).get('execution_method', 'unknown') if response.attempts else 'unknown'
+        "execution_method": getattr(response.attempts[-1], 'execution_metadata', {}).get('execution_method', 'sandboxed') if response.attempts else 'sandboxed',
+        "sandbox_used": True  
     })
     
     if len(session.conversation_history) > 10:
@@ -420,48 +429,12 @@ async def list_sessions():
                 "session_id": session_id,
                 "created_at": session.created_at,
                 "updated_at": session.updated_at,
-                "interactions": len(session.conversation_history)
+                "interactions": len(session.conversation_history),
+                "security": "Daytona Sandbox"
             }
             for session_id, session in sessions.items()
         ]
     }
-
-@app.post("/validate-code")
-async def validate_code_endpoint(request: dict):
-    code = request.get("code", "")
-    prompt = request.get("prompt", "")
-    
-    if not code:
-        raise HTTPException(status_code=400, detail="No code provided")
-    
-    result = validator.validate_code(code, prompt)
-    return result
-
-@app.post("/execute-with-inputs")
-async def execute_with_smart_inputs(request: dict):
-    code = request.get("code", "")
-    prompt = request.get("prompt", "")
-    
-    if not code:
-        raise HTTPException(status_code=400, detail="No code provided")
-    
-    try:
-        execution_result = validator.execute_code_with_smart_inputs(code, prompt)
-        
-        success_analysis = validator.validate_execution_success_only(
-            code=code,
-            prompt=prompt,
-            execution_result=execution_result
-        )
-        
-        return {
-            "execution_result": execution_result,
-            "success_analysis": success_analysis,
-            "overall_success": success_analysis['overall_success']
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Execution failed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

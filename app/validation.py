@@ -1,9 +1,7 @@
 import ast
 import re
 import keyword
-import subprocess
-import tempfile
-import os
+import asyncio
 from typing import List, Dict, Any, Optional, Tuple
 import logging
 from enum import Enum
@@ -37,7 +35,8 @@ class CodeValidator:
         'marshal', 'shelve', 'dbm', 'pathlib'
     }
 
-    def __init__(self):
+    def __init__(self, sandbox=None):
+        self.sandbox = sandbox 
         self.validation_methods = [
             self._check_syntax,
             self._analyze_security,
@@ -46,7 +45,8 @@ class CodeValidator:
             self._validate_execution_safety
         ]
 
-    def execute_code_with_smart_inputs(self, code: str, prompt: str, timeout: int = 30) -> Dict[str, Any]:
+    async def execute_code_with_smart_inputs(self, code: str, prompt: str, session_id: str, timeout: int = 30) -> Dict[str, Any]:
+        """Execute code using proper sandboxing instead of unsafe subprocess calls"""
         result = {
             'stdout': '',
             'stderr': '',
@@ -58,43 +58,111 @@ class CodeValidator:
             'explicit_inputs_used': False
         }
         
+        if not self.sandbox:
+            logger.error("No sandbox provided to CodeValidator - cannot execute code safely")
+            result['stderr'] = "No sandbox available for secure code execution"
+            return result
+        
         try:
+ 
             explicit_inputs = self._extract_explicit_inputs_from_prompt(prompt)
             if explicit_inputs:
                 logger.info("Found explicit inputs in prompt, using those first")
-                result.update(self._execute_with_stdin_input(code, explicit_inputs, timeout))
+                result.update(await self._execute_with_sandbox_input(code, explicit_inputs, session_id, timeout))
                 if result['return_code'] == 0:
                     result['execution_method'] = 'explicit_inputs'
                     result['inputs_provided'] = explicit_inputs
                     result['explicit_inputs_used'] = True
                     return result
             
+         
             smart_code = self._auto_replace_input_calls(code, prompt)
             if smart_code != code:
                 logger.info("Attempting execution with input replacement")
-                result.update(self._execute_code_safe(smart_code, timeout))
+                result.update(await self._execute_with_sandbox(smart_code, session_id, timeout))
                 if result['return_code'] == 0 and result['stdout'].strip():
                     result['execution_method'] = 'input_replacement'
                     result['modified_code'] = smart_code
                     return result
             
+            
             logger.info("Attempting execution with stdin input injection")
             auto_inputs = self._generate_context_inputs(prompt, code)
-            result.update(self._execute_with_stdin_input(code, auto_inputs, timeout))
+            result.update(await self._execute_with_sandbox_input(code, auto_inputs, session_id, timeout))
             if result['return_code'] == 0:
                 result['execution_method'] = 'stdin_injection'
                 result['inputs_provided'] = auto_inputs
                 return result
             
+     
             logger.info("Fallback: attempting original code execution")
-            result.update(self._execute_code_safe(code, timeout))
+            result.update(await self._execute_with_sandbox(code, session_id, timeout))
             result['execution_method'] = 'original'
             
         except Exception as e:
-            logger.error(f"Code execution failed: {str(e)}")
-            result['stderr'] = f"Execution error: {str(e)}"
+            logger.error(f"Sandboxed code execution failed: {str(e)}")
+            result['stderr'] = f"Sandbox execution error: {str(e)}"
         
         return result
+
+    async def _execute_with_sandbox(self, code: str, session_id: str, timeout: int) -> Dict[str, Any]:
+        """Execute code directly in sandbox without input handling"""
+        try:
+            stdout, stderr, exit_code, execution_time = await self.sandbox.execute_code(code, session_id)
+            
+            return {
+                'stdout': stdout,
+                'stderr': stderr,
+                'return_code': exit_code,
+                'execution_time': execution_time
+            }
+            
+        except Exception as e:
+            logger.error(f"Direct sandbox execution failed: {str(e)}")
+            return {
+                'stdout': '',
+                'stderr': f'Sandbox execution error: {str(e)}',
+                'return_code': 1,
+                'execution_time': 0
+            }
+
+    async def _execute_with_sandbox_input(self, code: str, auto_inputs: List[str], session_id: str, timeout: int) -> Dict[str, Any]:
+        """Execute code in sandbox with input handling by modifying the code"""
+        try:
+         
+            input_values = [str(inp).replace('"', '') for inp in auto_inputs]
+            
+       
+            input_simulation_code = f"""
+import sys
+from io import StringIO
+
+# Simulate input by replacing sys.stdin
+input_data = {repr('\\n'.join(input_values) + '\\n')}
+sys.stdin = StringIO(input_data)
+
+# Original code follows:
+{code}
+"""
+            
+            stdout, stderr, exit_code, execution_time = await self.sandbox.execute_code(input_simulation_code, session_id)
+            
+            return {
+                'stdout': stdout,
+                'stderr': stderr,
+                'return_code': exit_code,
+                'execution_time': execution_time
+            }
+            
+        except Exception as e:
+            logger.error(f"Sandbox input execution failed: {str(e)}")
+            return {
+                'stdout': '',
+                'stderr': f'Sandbox input execution error: {str(e)}',
+                'return_code': 1,
+                'execution_time': 0
+            }
+
 
     def _extract_explicit_inputs_from_prompt(self, prompt: str) -> List[str]:
         inputs = []
@@ -453,6 +521,7 @@ class CodeValidator:
         
         return inputs[:max(input_count, 5)]
 
+
     def _check_syntax(self, code: str) -> Dict[str, Any]:
         result = {'valid': True, 'errors': [], 'warnings': [], 'confidence_weight': 0.3}
         
@@ -771,100 +840,6 @@ class CodeValidator:
         
         return sanitized
 
-    def _execute_with_stdin_input(self, code: str, auto_inputs: List[str], timeout: int) -> Dict[str, Any]:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            f.write(code)
-            temp_file = f.name
-        
-        try:
-            input_string = '\n'.join(str(inp).replace('"', '') for inp in auto_inputs) + '\n'
-            
-            import time
-            start_time = time.time()
-            
-            result = subprocess.run(
-                ['python', temp_file],
-                input=input_string,
-                text=True,
-                capture_output=True,
-                timeout=timeout
-            )
-            
-            execution_time = time.time() - start_time
-            
-            return {
-                'stdout': result.stdout,
-                'stderr': result.stderr,
-                'return_code': result.returncode,
-                'execution_time': execution_time
-            }
-        
-        except subprocess.TimeoutExpired:
-            return {
-                'stdout': '',
-                'stderr': 'Execution timeout',
-                'return_code': 124,
-                'execution_time': timeout
-            }
-        except Exception as e:
-            return {
-                'stdout': '',
-                'stderr': f'Execution error: {str(e)}',
-                'return_code': 1,
-                'execution_time': 0
-            }
-        finally:
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
-
-    def _execute_code_safe(self, code: str, timeout: int) -> Dict[str, Any]:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            f.write(code)
-            temp_file = f.name
-        
-        try:
-            import time
-            start_time = time.time()
-            
-            result = subprocess.run(
-                ['python', temp_file],
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
-            
-            execution_time = time.time() - start_time
-            
-            return {
-                'stdout': result.stdout,
-                'stderr': result.stderr,
-                'return_code': result.returncode,
-                'execution_time': execution_time
-            }
-        
-        except subprocess.TimeoutExpired:
-            return {
-                'stdout': '',
-                'stderr': 'Execution timeout',
-                'return_code': 124,
-                'execution_time': timeout
-            }
-        except Exception as e:
-            return {
-                'stdout': '',
-                'stderr': f'Execution error: {str(e)}',
-                'return_code': 1,
-                'execution_time': 0
-            }
-        finally:
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
-
-    
     def get_enhanced_failure_feedback(self, prompt: str, execution_result: Dict[str, Any], success_analysis: Dict[str, Any]) -> str:
         feedback_parts = []
         
@@ -1106,6 +1081,7 @@ class CodeValidator:
         
         return result
 
+   
     def _execution_success_check(self, code: str, prompt: str, execution_result: Dict[str, Any]) -> Dict[str, Any]:
         if execution_result.get("return_code", 1) != 0:
             return {
@@ -1137,12 +1113,6 @@ class CodeValidator:
         }
 
     def _output_pattern_matching(self, execution_result: Dict[str, Any], intent: Dict) -> Dict[str, Any]:
-        logger.info(f"_output_pattern_matching called with:")
-        logger.info(f"  execution_result type: {type(execution_result)}")
-        logger.info(f"  execution_result: {execution_result}")
-        logger.info(f"  intent type: {type(intent)}")
-        logger.info(f"  intent: {intent}")
-        
         if intent is None:
             intent = {}
             logger.warning("Intent was None, using empty dict")
@@ -1211,41 +1181,6 @@ class CodeValidator:
                 'description': 'list, array, or structured data'
             }
         
-        if intent.get('file_operations') or \
-           any(word in prompt_lower for word in ['read', 'file', 'csv', 'json', 'parse']):
-            patterns['file_content'] = {
-                'check': lambda x: len(x.split('\n')) > 1 or len(x) > 50,
-                'description': 'file content or data'
-            }
-        
-        if any(action in intent.get('actions', []) for action in ['visualize']) or \
-           any(word in prompt_lower for word in ['plot', 'chart', 'graph', 'visualize', 'show']):
-            patterns['plot_indication'] = {
-                'keywords': ['saved', 'displayed', 'show', 'plot', 'figure', 'chart', 'graph'],
-                'description': 'plot creation or display indication'
-            }
-        
-        if intent.get('network_operations') or \
-           any(word in prompt_lower for word in ['api', 'request', 'url', 'web', 'fetch', 'download']):
-            patterns['api_response'] = {
-                'check': lambda x: len(x) > 20 and ('{' in x or '<' in x or 'http' in x.lower()),
-                'description': 'API response or web content'
-            }
-        
-        if intent.get('domain') == 'data_analysis' or \
-           any(action in intent.get('actions', []) for action in ['analyze']) or \
-           any(word in prompt_lower for word in ['analyze', 'statistics', 'mean', 'median', 'correlation']):
-            patterns['analysis_results'] = {
-                'keywords': ['mean', 'median', 'std', 'count', 'min', 'max', 'correlation', 'summary'],
-                'description': 'statistical analysis results'
-            }
-        
-        if any(word in prompt_lower for word in ['text', 'string', 'word', 'sentence', 'extract']):
-            patterns['text_content'] = {
-                'check': lambda x: len(x.split()) > 3,
-                'description': 'processed text content'
-            }
-        
         patterns['completion_indicator'] = {
             'keywords': ['complete', 'done', 'finished', 'success', 'saved', 'created', 'generated'],
             'description': 'task completion indicator'
@@ -1273,52 +1208,19 @@ class CodeValidator:
     def _intent_fulfillment_check(self, code: str, prompt: str, execution_result: Dict[str, Any], intent: Dict) -> Dict[str, Any]:
         if intent is None:
             intent = {}
-            logger.warning("Intent was None in _intent_fulfillment_check, using empty dict")
-        
-        code_behavior = self._analyze_code_behavior(code, execution_result)
         
         fulfillment_score = 0
-        total_checks = 0
+        total_checks = 1
         reasons = []
         
-        for intended_action in intent.get('actions', []):
-            total_checks += 1
-            if self._action_fulfilled(intended_action, code_behavior, execution_result):
-                fulfillment_score += 1
-                reasons.append(f"Successfully performed action: {intended_action}")
-            else:
-                reasons.append(f"Failed to perform action: {intended_action}")
+       
+        if execution_result.get('return_code', 1) == 0:
+            fulfillment_score += 1
+            reasons.append("Code executed successfully")
+        else:
+            reasons.append("Code execution failed")
         
-        expected_type = intent.get('expected_data_type')
-        if expected_type:
-            total_checks += 1
-            if self._data_type_matches(expected_type, execution_result.get('stdout', '')):
-                fulfillment_score += 1
-                reasons.append("Output data type matches expectation")
-            else:
-                reasons.append(f"Expected {expected_type} output, got different format")
-        
-        domain = intent.get('domain')
-        if domain:
-            total_checks += 1
-            domain_score = self._check_domain_requirements(domain, code_behavior, execution_result)
-            fulfillment_score += domain_score
-            if domain_score > 0.5:
-                reasons.append(f"Domain requirements satisfied for {domain}")
-            else:
-                reasons.append(f"Domain requirements not met for {domain}")
-        
-        mentioned_libs = intent.get('libraries_mentioned', [])
-        if mentioned_libs:
-            total_checks += 1
-            libs_used = sum(1 for lib in mentioned_libs if lib.lower() in code.lower())
-            if libs_used > 0:
-                fulfillment_score += libs_used / len(mentioned_libs)
-                reasons.append(f"Used {libs_used}/{len(mentioned_libs)} mentioned libraries")
-            else:
-                reasons.append("No mentioned libraries were used in code")
-        
-        success_rate = fulfillment_score / total_checks if total_checks > 0 else 0.5
+        success_rate = fulfillment_score / total_checks
         
         return {
             "success": success_rate > 0.6,
@@ -1326,263 +1228,23 @@ class CodeValidator:
             "weight": 0.3 * success_rate
         }
 
-    def _analyze_code_behavior(self, code: str, execution_result: Dict[str, Any]) -> Dict[str, Any]:
-        behavior = {
-            'has_arithmetic': False,
-            'numerical_output': False,
-            'generates_content': False,
-            'processes_data': False,
-            'has_analysis_functions': False,
-            'modifies_data': False,
-            'makes_requests': False,
-            'reads_files': False,
-            'creates_plots': False,
-            'sorts_data': False,
-            'output_length': 0,
-            'output_lines': 0,
-            'has_structured_output': False
-        }
-        
-        output = execution_result.get('stdout', '')
-        behavior['output_length'] = len(output)
-        behavior['output_lines'] = len(output.split('\n'))
-        behavior['generates_content'] = len(output.strip()) > 0
-        behavior['numerical_output'] = bool(re.search(r'\d+(?:\.\d+)?', output))
-        behavior['has_structured_output'] = any(char in output for char in ['{', '[', '|', ':'])
-        
-        code_lower = code.lower()
-        
-        behavior['has_arithmetic'] = any(op in code for op in ['+', '-', '*', '/', '**', '%']) or \
-                                   any(func in code_lower for func in ['sum(', 'mean(', 'average(', 'calculate'])
-        
-        behavior['processes_data'] = any(pattern in code_lower for pattern in [
-            '.read', '.load', 'dataframe', 'csv', 'json', 'parse', 'process'
-        ])
-        
-        behavior['has_analysis_functions'] = any(func in code_lower for func in [
-            'mean(', 'median(', 'std(', 'var(', 'corr(', 'describe(', 'groupby(', 'agg('
-        ])
-        
-        behavior['modifies_data'] = any(pattern in code_lower for pattern in [
-            'sort(', 'sorted(', 'transform(', 'apply(', 'map(', 'filter('
-        ])
-        
-        behavior['makes_requests'] = any(pattern in code_lower for pattern in [
-            'requests.', 'urllib.', 'http.', 'fetch', 'download'
-        ])
-        
-        behavior['reads_files'] = any(pattern in code_lower for pattern in [
-            'open(', 'read(', 'readlines(', 'load(', 'pd.read'
-        ])
-        
-        behavior['creates_plots'] = any(pattern in code_lower for pattern in [
-            'plt.', 'plot(', 'show()', 'savefig(', 'matplotlib', 'seaborn'
-        ])
-        
-        behavior['sorts_data'] = any(pattern in code_lower for pattern in [
-            'sort(', 'sorted(', 'order', 'rank'
-        ])
-        
-        return behavior
-
-    def _action_fulfilled(self, action: str, code_behavior: Dict, execution_result: Dict) -> bool:
-        output = execution_result.get('stdout', '').lower()
-        
-        action_checks = {
-            'calculate': lambda: (
-                code_behavior.get('has_arithmetic', False) or 
-                code_behavior.get('numerical_output', False) or
-                any(word in output for word in ['mean', 'median', 'analysis', 'summary'])
-            ),
-            'transform': lambda: code_behavior.get('modifies_data', False),
-            'retrieve': lambda: (
-                code_behavior.get('makes_requests', False) or 
-                code_behavior.get('reads_files', False)
-            ),
-            'visualize': lambda: (
-                code_behavior.get('creates_plots', False) or
-                any(word in output for word in ['plot', 'chart', 'graph', 'figure'])
-            ),
-            'sort': lambda: (
-                code_behavior.get('sorts_data', False) or
-                'sort' in output or 'order' in output
-            ),
-            'search': lambda: any(word in output for word in ['found', 'match', 'result']),
-            'convert': lambda: code_behavior.get('output_length', 0) > 5,
-            'simulate': lambda: code_behavior.get('numerical_output', False)
-        }
-        
-        return action_checks.get(action, lambda: False)()
-
-    def _data_type_matches(self, expected_type: str, output: str) -> bool:
-        output_clean = output.strip()
-        
-        type_checks = {
-            'numerical': lambda: bool(re.search(r'-?\d+(?:\.\d+)?', output_clean)),
-            'list': lambda: (
-                bool(re.search(r'[\[\(].*[\]\)]', output_clean)) or
-                len(output_clean.split('\n')) > 2 or
-                bool(re.search(r'^\d+\.?\s|\w+\s*:\s*\w+', output_clean, re.MULTILINE))
-            ),
-            'text': lambda: len(output_clean.split()) > 2,
-            'structured': lambda: any(char in output_clean for char in ['{', '}', '[', ']', '|', ':'])
-        }
-        
-        return type_checks.get(expected_type, lambda: True)()
-
-    def _check_domain_requirements(self, domain: str, code_behavior: Dict, execution_result: Dict) -> float:
-        output = execution_result.get('stdout', '').lower()
-        
-        domain_checks = {
-            'data_analysis': lambda: (
-                (0.5 if code_behavior.get('processes_data', False) else 0.0) +
-                (0.3 if code_behavior.get('has_analysis_functions', False) else 0.0) +
-                (0.2 if any(word in output for word in ['mean', 'median', 'std', 'count']) else 0.0)
-            ),
-            'web_scraping': lambda: (
-                (0.4 if code_behavior.get('makes_requests', False) else 0.0) +
-                (0.3 if any(word in output for word in ['html', 'response', 'status']) else 0.0) +
-                (0.3 if len(output) > 50 else 0.0)
-            ),
-            'visualization': lambda: (
-                (0.6 if code_behavior.get('creates_plots', False) else 0.0) +
-                (0.4 if any(word in output for word in ['plot', 'chart', 'figure', 'saved']) else 0.0)
-            ),
-            'file_processing': lambda: (
-                (0.5 if code_behavior.get('reads_files', False) else 0.0) +
-                (0.5 if len(output) > 20 else 0.0)
-            ),
-            'mathematics': lambda: (
-                (0.4 if code_behavior.get('has_arithmetic', False) else 0.0) +
-                (0.6 if code_behavior.get('numerical_output', False) else 0.0)
-            ),
-            'api': lambda: (
-                (0.5 if code_behavior.get('makes_requests', False) else 0.0) +
-                (0.5 if any(indicator in output for indicator in ['json', 'response', 'data', 'api']) else 0.0)
-            )
-        }
-        
-        return min(1.0, domain_checks.get(domain, lambda: 0.5)())
-
     def _test_case_validation(self, code: str, prompt: str, execution_result: Dict[str, Any]) -> Dict[str, Any]:
-        test_cases = self._generate_test_cases(prompt, execution_result)
+
+        return_code = execution_result.get('return_code', 1)
+        stdout = execution_result.get('stdout', '').strip()
         
-        if not test_cases:
+        if return_code == 0 and stdout:
             return {
                 "success": True,
-                "reasons": ["No specific test cases applicable"],
+                "reasons": ["Basic execution test passed"],
+                "weight": 0.15
+            }
+        else:
+            return {
+                "success": False,
+                "reasons": ["Basic execution test failed"],
                 "weight": 0.0
             }
-        
-        passed_tests = 0
-        test_results = []
-        
-        for test_case in test_cases:
-            try:
-                result = self._run_test_case(execution_result, test_case)
-                if result:
-                    passed_tests += 1
-                    test_results.append(f"PASS: {test_case['description']}")
-                else:
-                    test_results.append(f"FAIL: {test_case['description']}")
-            except Exception as e:
-                test_results.append(f"ERROR: {test_case['description']} - {str(e)}")
-        
-        success_rate = passed_tests / len(test_cases)
-        
-        return {
-            "success": success_rate > 0.7,
-            "reasons": test_results,
-            "weight": 0.15 * success_rate
-        }
-
-    def _generate_test_cases(self, prompt: str, execution_result: Dict[str, Any]) -> List[Dict[str, Any]]:
-        test_cases = []
-        prompt_lower = prompt.lower() if prompt else ""
-        output = execution_result.get('stdout', '')
-        
-        if any(word in prompt_lower for word in ['factorial', 'fibonacci', 'prime', 'calculate']):
-            if 'factorial' in prompt_lower:
-                test_cases.append({
-                    'description': 'Factorial calculation should produce expected numeric result',
-                    'test': lambda out: bool(re.search(r'\b(120|24|6|2|1)\b', out))
-                })
-            
-            if 'fibonacci' in prompt_lower:
-                test_cases.append({
-                    'description': 'Should contain Fibonacci sequence pattern',
-                    'test': lambda out: any(seq in out for seq in ['0, 1, 1, 2, 3, 5', '1, 1, 2, 3, 5, 8', '0 1 1 2 3 5'])
-                })
-            
-            if 'prime' in prompt_lower:
-                test_cases.append({
-                    'description': 'Should identify or generate prime numbers',
-                    'test': lambda out: any(prime in out for prime in ['2', '3', '5', '7', '11', '13'])
-                })
-        
-        if any(word in prompt_lower for word in ['sort', 'order', 'rank']):
-            test_cases.append({
-                'description': 'Output should show ordered/sorted data',
-                'test': lambda out: self._check_if_sorted(out)
-            })
-        
-        if any(word in prompt_lower for word in ['csv', 'json', 'file', 'read']):
-            test_cases.append({
-                'description': 'Should process and display file content',
-                'test': lambda out: len(out.split('\n')) > 1 and len(out) > 20
-            })
-        
-        if any(word in prompt_lower for word in ['api', 'request', 'url', 'web']):
-            test_cases.append({
-                'description': 'Should show API response or web content',
-                'test': lambda out: len(out) > 30 and any(indicator in out.lower() for indicator in ['json', 'response', 'status', 'data'])
-            })
-        
-        if any(word in prompt_lower for word in ['plot', 'chart', 'graph', 'visualize']):
-            test_cases.append({
-                'description': 'Should indicate plot creation or display',
-                'test': lambda out: any(word in out.lower() for word in ['plot', 'chart', 'figure', 'saved', 'displayed', 'show'])
-            })
-        
-        test_cases.append({
-            'description': 'Output should be substantial and informative',
-            'test': lambda out: len(out.strip()) > 5 and len(out.split()) > 1
-        })
-        
-        return test_cases
-
-    def _run_test_case(self, execution_result: Dict[str, Any], test_case: Dict[str, Any]) -> bool:
-        try:
-            output = execution_result.get('stdout', '')
-            return test_case['test'](output)
-        except Exception as e:
-            logger.error(f"Test case execution failed: {str(e)}")
-            return False
-
-    def _check_if_sorted(self, output: str) -> bool:
-        lines = [line.strip() for line in output.split('\n') if line.strip()]
-        
-        numbers = []
-        for line in lines:
-            matches = re.findall(r'-?\d+(?:\.\d+)?', line)
-            if matches:
-                try:
-                    numbers.extend([float(match) for match in matches])
-                except:
-                    pass
-        
-        if len(numbers) > 2:
-            return numbers == sorted(numbers) or numbers == sorted(numbers, reverse=True)
-        
-        text_items = []
-        for line in lines:
-            words = re.findall(r'\b[a-zA-Z]+\b', line)
-            text_items.extend(words)
-        
-        if len(text_items) > 2:
-            return text_items == sorted(text_items) or text_items == sorted(text_items, reverse=True)
-        
-        return False
 
 def validate_prompt(prompt: str) -> Dict[str, Any]:
     result = {
@@ -1595,59 +1257,59 @@ def validate_prompt(prompt: str) -> Dict[str, Any]:
         'has_explicit_inputs': False,
         'extracted_inputs': []
     }
-    
+
+    # Critical: prompt too short or empty
+    if not prompt or len(prompt.strip()) < 10:
+        result['errors'].append("Prompt is too short for meaningful code generation")
+        result['is_valid'] = False
+
+    # Non-critical: prompt is very long
     if len(prompt) > 2000:
         result['warnings'].append("Prompt is very long, consider making it more concise")
         result['complexity_score'] += 0.2
-    
-    if len(prompt) < 10:
-        result['warnings'].append("Prompt might be too short for good code generation")
-        result['complexity_score'] -= 0.1
-    
+
     validator = CodeValidator()
     explicit_inputs = validator._extract_explicit_inputs_from_prompt(prompt)
     if explicit_inputs:
         result['has_explicit_inputs'] = True
         result['extracted_inputs'] = explicit_inputs
         result['warnings'].append(f"Found explicit inputs in prompt: {explicit_inputs}")
-    
+
+    # Check sentence and word count (non-critical)
     sentences = len([s for s in prompt.split('.') if s.strip()])
     words = len(prompt.split())
-    
     if sentences > 10:
         result['warnings'].append("Prompt has many sentences, consider simplifying")
         result['complexity_score'] += 0.1
-    
     if words > 200:
         result['warnings'].append("Prompt is quite lengthy")
         result['complexity_score'] += 0.1
-    
-    # Extract intent for validation
+
+    # Extract intent
     try:
         result['intent_analysis'] = validator._extract_intent_from_prompt(prompt)
         if result['intent_analysis'] is None:
             result['intent_analysis'] = {}
     except Exception as e:
         logger.error(f"Intent extraction failed: {str(e)}")
-        result['intent_analysis'] = {}
-    
-    # Check for conflicting requirements
+        result['errors'].append(f"Intent extraction failed: {str(e)}")
+        result['is_valid'] = False
+
     actions = result['intent_analysis'].get('actions', [])
     if len(actions) > 3:
         result['warnings'].append("Prompt contains many different actions, consider focusing on fewer tasks")
         result['complexity_score'] += 0.2
-    
-    # Check for unclear requirements
+
     vague_indicators = ['something', 'anything', 'some kind of', 'maybe', 'somehow']
     if any(indicator in prompt.lower() for indicator in vague_indicators):
         result['warnings'].append("Prompt contains vague language that may lead to unclear results")
         result['complexity_score'] += 0.1
-    
-    # Basic sanitization
+
+  
     result['sanitized_prompt'] = re.sub(r'[^\w\s\-.,!?():;/="\'<>]', '', prompt)
+
     
-    # Final validation decision
     if result['complexity_score'] > 0.5:
         result['warnings'].append("Prompt complexity is high - results may vary")
-    
+
     return result

@@ -223,7 +223,7 @@ Generate only the modified Python code:"""
         for attempt in range(self.max_retries):
             try:
                 response = self.model.generate_content(prompt)
-                
+                print(response)
                 if response.text:
                     return response.text
                 else:
@@ -244,26 +244,7 @@ Generate only the modified Python code:"""
                     logger.error(f"Gemini API call failed after {self.max_retries} attempts: {str(e)}")
                     raise
 
-    def _extract_code_from_response(self, response: str) -> str:
-        if not response:
-            raise Exception("Empty response from AI")
-        
-        if self.system_prompt in response:
-            response = response.replace(self.system_prompt, "").strip()
-        
-        if "```python" in response:
-            start = response.find("```python") + 9
-            end = response.find("```", start)
-            if end != -1:
-                return response[start:end].strip()
-        
-        elif "```" in response:
-            start = response.find("```") + 3
-            end = response.find("```", start)
-            if end != -1:
-                return response[start:end].strip()
-        
-        return response.strip()
+    
 
     async def check_connection(self) -> bool:
         try:
@@ -313,3 +294,24 @@ Generate only the modified Python code:"""
             return f"Resets in {self.rate_limiter._time_until_reset()}"
         else:
             return "Please check your Gemini API quota in the Google AI Studio console"
+        
+    def _extract_code_from_response(self, response: str) -> str:
+        if not response:
+            raise Exception("Empty response from AI")
+        
+        if self.system_prompt in response:
+            response = response.replace(self.system_prompt, "").strip()
+        
+        if "```python" in response:
+            start = response.find("```python") + 9
+            end = response.find("```", start)
+            if end != -1:
+                return response[start:end].strip()
+        
+        elif "```" in response:
+            start = response.find("```") + 3
+            end = response.find("```", start)
+            if end != -1:
+                return response[start:end].strip()
+        
+        return response.strip()
